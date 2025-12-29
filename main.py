@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 import time
@@ -41,8 +42,8 @@ def draw_axis_aligned_box(img, x1, y1, x2, y2, margin=3, color=(255, 0, 0), thic
     cv2.rectangle(img, (xmin, ymin), (xmax, ymax), color, thickness)
 
 # ----- Mouse interaction helpers -----
-HANDLE_SIZE = 8  # pixels for corner handle squares
-HANDLE_HIT_RADIUS = 12  # click proximity to detect handle
+HANDLE_SIZE = 8
+HANDLE_HIT_RADIUS = 12
 
 def point_in_rect(px, py, rx, ry, rw, rh):
     return rx <= px <= rx + rw and ry <= py <= ry + rh
@@ -61,12 +62,11 @@ class ROIController:
         self.x, self.y, self.w, self.h = clamp_roi(x, y, w, h, img_shape)
         self.dragging = False
         self.resizing = False
-        self.resize_anchor = None  # which corner is grabbed: 'tl', 'tr', 'bl', 'br'
+        self.resize_anchor = None
         self.drag_offset = (0, 0)
         self.img_shape = img_shape
 
     def corners(self):
-        """Return corner positions as dict."""
         tl = (self.x, self.y)
         tr = (self.x + self.w, self.y)
         bl = (self.x, self.y + self.h)
@@ -74,7 +74,6 @@ class ROIController:
         return {"tl": tl, "tr": tr, "bl": bl, "br": br}
 
     def handle_hit(self, mx, my):
-        """Return corner key if the mouse is near a corner, else None."""
         cs = self.corners()
         for name, (cx, cy) in cs.items():
             if near_point(mx, my, cx, cy, HANDLE_HIT_RADIUS):
@@ -84,7 +83,6 @@ class ROIController:
     def on_mouse(self, event, mx, my, flags, param):
         """Mouse callback to update ROI based on interactions."""
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Check for corner handle first (resize)
             hit = self.handle_hit(mx, my)
             if hit is not None:
                 self.resizing = True
@@ -92,7 +90,6 @@ class ROIController:
                 self.dragging = False
                 return
 
-            # Else, click inside ROI to start dragging
             if point_in_rect(mx, my, self.x, self.y, self.w, self.h):
                 self.dragging = True
                 self.resizing = False
@@ -101,12 +98,10 @@ class ROIController:
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.dragging:
-                # Move ROI so that top-left follows mouse minus initial offset
                 nx = mx - self.drag_offset[0]
                 ny = my - self.drag_offset[1]
                 self.x, self.y, self.w, self.h = clamp_roi(nx, ny, self.w, self.h, self.img_shape)
             elif self.resizing and self.resize_anchor:
-                # Resize based on which corner is grabbed
                 if self.resize_anchor == 'tl':
                     nx = min(mx, self.x + self.w - 1)
                     ny = min(my, self.y + self.h - 1)
@@ -139,9 +134,7 @@ class ROIController:
 
     def draw(self, img):
         """Draw ROI box and corner handles."""
-        # ROI box
         cv2.rectangle(img, (self.x, self.y), (self.x + self.w, self.y + self.h), (255, 0, 255), 2)
-        # Corner handles
         for (cx, cy) in self.corners().values():
             cv2.rectangle(img,
                           (cx - HANDLE_SIZE // 2, cy - HANDLE_SIZE // 2),
@@ -159,19 +152,23 @@ def main():
     # Set capture resolution & FPS (lower if preview lags)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     # Detection params (box all lines regardless of size)
     CANNY_LOW = 30
     CANNY_HIGH = 100
-    HOUGH_THRESHOLD = 70
+    HOUGH_THRESHOLD = 70  # will be adjusted by mouse wheel
     MIN_LINE_LENGTH = 3
     MAX_LINE_GAP = 12
 
-    window_name = "Drag ROI with Mouse | Lines (boxed) in ROI (left) | Edges (right)"
+    HOUGH_MIN = 10   # clamp low end to avoid too much noise
+    HOUGH_MAX = 200  # clamp high end to avoid missing everything
+    HOUGH_STEP = 5   # per mouse wheel notch
+
+    window_name = "Drag ROI + Mouse Wheel Adjust (HOUGH_THRESHOLD) | Lines (left) | Edges (right)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Initialize a dummy frame to get dimensions for ROIController
+    # Read an initial frame
     ok, frame = cap.read()
     if not ok or frame is None:
         print("[error] Could not read initial frame.")
@@ -182,10 +179,25 @@ def main():
     # ROI starts centered covering ~50% of the frame
     roi = ROIController(x=W//4, y=H//4, w=W//2, h=H//2, img_shape=frame.shape)
 
-    # Set mouse callback
-    # cv2.setMouseCallback(window_name, lambda e, x, y, f, p: roi.on_mouse(e, x, y, f, p))
+    # Shared state to let mouse callback adjust HOUGH_THRESHOLD
+    state = {"HOUGH_THRESHOLD": HOUGH_THRESHOLD}
 
-    # Arrow key codes (Windows, via waitKeyEx)
+    # Mouse callback combining ROI interactions + mouse wheel adjustment
+    def mouse_cb(event, mx, my, flags, param):
+        # First pass ROI interactions to controller
+        roi.on_mouse(event, mx, my, flags, param)
+
+        # Handle mouse wheel for HOUGH_THRESHOLD
+        if event == cv2.EVENT_MOUSEWHEEL:
+            # On many platforms: flags > 0 means wheel up, flags < 0 means wheel down
+            if flags > 0:
+                state["HOUGH_THRESHOLD"] = min(HOUGH_MAX, state["HOUGH_THRESHOLD"] + HOUGH_STEP)
+            else:
+                state["HOUGH_THRESHOLD"] = max(HOUGH_MIN, state["HOUGH_THRESHOLD"] - HOUGH_STEP)
+
+    cv2.setMouseCallback(window_name, mouse_cb)
+
+    # Arrow key codes (Windows via waitKeyEx)
     VK_LEFT  = 2424832
     VK_RIGHT = 2555904
     VK_UP    = 2490368
@@ -195,7 +207,9 @@ def main():
     size_w_step = 10
     size_h_step = 6
 
-    # print("[info] Controls: click-drag inside ROI to move; drag corner squares to resize; +/- resize; arrows/WASD move; s snapshot; q quit.")
+    print("[info] Controls:")
+    print("   • Mouse: click-drag inside ROI to move; drag corner squares to resize; scroll wheel adjusts Hough threshold")
+    print("   • Keys: +/- resize ROI, arrows/WASD move ROI, s snapshot, q quit")
     while True:
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -216,12 +230,13 @@ def main():
         # Edges in ROI
         edges_roi = cv2.Canny(roi_gray, CANNY_LOW, CANNY_HIGH, apertureSize=3)
 
-        # HoughLinesP on ROI
+        # HoughLinesP on ROI using current threshold from mouse wheel state
+        HOUGH_THRESHOLD_CURR = state["HOUGH_THRESHOLD"]
         lines_p = cv2.HoughLinesP(
             edges_roi,
             rho=1,
             theta=np.pi / 180,
-            threshold=HOUGH_THRESHOLD,
+            threshold=HOUGH_THRESHOLD_CURR,
             minLineLength=MIN_LINE_LENGTH,
             maxLineGap=MAX_LINE_GAP
         )
@@ -241,24 +256,31 @@ def main():
                 draw_axis_aligned_box(output, gx1, gy1, gx2, gy2, margin=3, color=(255, 0, 0), thickness=2)
                 box_count += 1
 
-        # Overlay counts
+        # Overlay counts and current HOUGH_THRESHOLD
         cv2.putText(output, f"Boxes in ROI: {box_count}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(output, f"Hough threshold: {HOUGH_THRESHOLD_CURR}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2, cv2.LINE_AA)
+        cv2.putText(output, "Wheel: up stricter / down more sensitive", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2, cv2.LINE_AA)
 
         # Build right-side edges view (place ROI edges back into full frame)
         edges_full = np.zeros_like(gray)
         edges_full[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w] = edges_roi
         edges_bgr = cv2.cvtColor(edges_full, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(edges_bgr, (roi.x, roi.y), (roi.x + roi.w, roi.y + roi.h), (255, 0, 255), 2)
-        # Also draw corner handles on the edges view for consistent UI
+        # Corner handles on edges view
         for (cx, cy) in roi.corners().values():
             cv2.rectangle(edges_bgr,
                           (cx - HANDLE_SIZE // 2, cy - HANDLE_SIZE // 2),
                           (cx + HANDLE_SIZE // 2, cy + HANDLE_SIZE // 2),
                           (255, 0, 255), -1)
 
-        combined = np.hstack((output, edges_bgr))
-        display_frame = cv2.resize(combined, (800, 600))
+        # combined = np.hstack((output, edges_bgr))
+        # display_frame = cv2.resize(combined, (800, 600))
+        # cv2.imshow(window_name, display_frame)
+
+        display_frame = cv2.resize(output, (800, 600))
         cv2.imshow(window_name, display_frame)
 
         # Use waitKeyEx for extended keys (arrows)
