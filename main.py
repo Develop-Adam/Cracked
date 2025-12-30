@@ -141,6 +141,28 @@ class ROIController:
                           (cx + HANDLE_SIZE // 2, cy + HANDLE_SIZE // 2),
                           (255, 0, 255), -1)
 
+# ---- Vertical filtering helpers ----
+def line_angle_deg(x1, y1, x2, y2):
+    """
+    Returns the line angle in degrees mapped to [0, 180).
+    0° is horizontal (left->right), 90° is vertical.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return None
+    angle = (np.degrees(np.arctan2(dy, dx)) + 180) % 180
+    return angle
+
+def is_near_vertical(x1, y1, x2, y2, tol_deg=10):
+    """
+    True if the line segment angle is within tol_deg of 90° (vertical).
+    """
+    angle = line_angle_deg(x1, y1, x2, y2)
+    if angle is None:
+        return False
+    return abs(angle - 90.0) <= tol_deg
+
 def main():
     cap, cam_idx = open_camera(preferred_index=0)
     if cap is None:
@@ -165,7 +187,14 @@ def main():
     HOUGH_MAX = 200  # clamp high end to avoid missing everything
     HOUGH_STEP = 5   # per mouse wheel notch
 
-    window_name = "Drag ROI + Mouse Wheel Adjust (HOUGH_THRESHOLD) | Lines (left) | Edges (right)"
+    # Vertical filter settings
+    IGNORE_VERTICAL = True
+    TOL_VERTICAL_DEG = 10         # initial tolerance around 90°
+    TOL_VERTICAL_DEG_MIN = 0
+    TOL_VERTICAL_DEG_MAX = 45
+    TOL_VERTICAL_STEP = 1
+
+    window_name = "Drag ROI + Mouse Wheel (Hough threshold) | Lines view"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     # Read an initial frame
@@ -210,6 +239,8 @@ def main():
     print("[info] Controls:")
     print("   • Mouse: click-drag inside ROI to move; drag corner squares to resize; scroll wheel adjusts Hough threshold")
     print("   • Keys: +/- resize ROI, arrows/WASD move ROI, s snapshot, q quit")
+    print("   • Vertical filter: [ decreases tol, ] increases tol; v toggles ignore-vertical on/off")
+
     while True:
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -246,10 +277,16 @@ def main():
         # Draw ROI and handles
         roi.draw(output)
 
-        # Draw every detected line + box; count them
+        # Draw every detected line + box; count them (after vertical filtering)
         box_count = 0
+        filtered_count = 0
         if lines_p is not None and len(lines_p) > 0:
             for x1, y1, x2, y2 in lines_p[:, 0]:
+                # Skip near-vertical lines if enabled
+                if IGNORE_VERTICAL and is_near_vertical(x1, y1, x2, y2, tol_deg=TOL_VERTICAL_DEG):
+                    filtered_count += 1
+                    continue
+
                 gx1, gy1 = x1 + roi.x, y1 + roi.y
                 gx2, gy2 = x2 + roi.x, y2 + roi.y
                 cv2.line(output, (gx1, gy1), (gx2, gy2), (0, 255, 0), 2)
@@ -261,25 +298,20 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(output, f"Hough threshold: {HOUGH_THRESHOLD_CURR}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2, cv2.LINE_AA)
-        cv2.putText(output, "Wheel: up stricter / down more sensitive", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2, cv2.LINE_AA)
 
-        # Build right-side edges view (place ROI edges back into full frame)
-        edges_full = np.zeros_like(gray)
-        edges_full[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w] = edges_roi
-        edges_bgr = cv2.cvtColor(edges_full, cv2.COLOR_GRAY2BGR)
-        cv2.rectangle(edges_bgr, (roi.x, roi.y), (roi.x + roi.w, roi.y + roi.h), (255, 0, 255), 2)
-        # Corner handles on edges view
-        for (cx, cy) in roi.corners().values():
-            cv2.rectangle(edges_bgr,
-                          (cx - HANDLE_SIZE // 2, cy - HANDLE_SIZE // 2),
-                          (cx + HANDLE_SIZE // 2, cy + HANDLE_SIZE // 2),
-                          (255, 0, 255), -1)
+        # Vertical filter overlay
+        cv2.putText(
+            output,
+            f"Ignore vertical: {'ON' if IGNORE_VERTICAL else 'OFF'} | tol ±{TOL_VERTICAL_DEG}° | filtered: {filtered_count}",
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2, cv2.LINE_AA
+        )
+        cv2.putText(output, "Wheel: up stricter / down more sensitive", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 2, cv2.LINE_AA)
+        cv2.putText(output, "[ ] tol, v toggle vertical filter", (10, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 2, cv2.LINE_AA)
 
-        # combined = np.hstack((output, edges_bgr))
-        # display_frame = cv2.resize(combined, (800, 600))
-        # cv2.imshow(window_name, display_frame)
-
+        # Show single view (left: annotated frame)
         display_frame = cv2.resize(output, (800, 600))
         cv2.imshow(window_name, display_frame)
 
@@ -288,6 +320,7 @@ def main():
         if key == ord('q'):
             break
         elif key == ord('s'):
+            # NOTE: 's' also appears in WASD; snapshot takes precedence.
             ts = int(time.time())
             out_name = f"snapshot_{ts}.jpg"
             ok = cv2.imwrite(out_name, output)
@@ -311,7 +344,7 @@ def main():
             roi.w -= size_w_step
             roi.h -= size_h_step
 
-        # WASD fallback
+        # WASD fallback (note: 's' is snapshot above)
         elif key == ord('a'):
             roi.x -= move_step
         elif key == ord('d'):
@@ -320,6 +353,14 @@ def main():
             roi.y -= move_step
         elif key == ord('s'):
             roi.y += move_step
+
+        # Vertical filter tuning
+        elif key == ord('['):
+            TOL_VERTICAL_DEG = max(TOL_VERTICAL_DEG_MIN, TOL_VERTICAL_DEG - TOL_VERTICAL_STEP)
+        elif key == ord(']'):
+            TOL_VERTICAL_DEG = min(TOL_VERTICAL_DEG_MAX, TOL_VERTICAL_DEG + TOL_VERTICAL_STEP)
+        elif key == ord('v'):
+            IGNORE_VERTICAL = not IGNORE_VERTICAL
 
         # Re-clamp after any change
         roi.x, roi.y, roi.w, roi.h = clamp_roi(roi.x, roi.y, roi.w, roi.h, frame.shape)
